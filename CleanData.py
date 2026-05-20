@@ -1,49 +1,62 @@
-import pandas as pd   # library nekhedmou beha data tables w manipulation taa csv files
-import json
+# cleandata.py
+import os
+import pandas as pd
 
-# Load kaggle csv file fi dataframe (df=dataframe=A data table in pandas kima Excel)
-df = pd.read_csv("data/recipes.csv")
+# Get the directory where this script lives
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-#  nkhalliw ken columns li hachetna bihom . The double brackets [[...]] mean "select these specific columns"
-df = df[[
-    "Name",
-    "RecipeIngredientParts",      # ingredients
-    "RecipeIngredientQuantities", # quantities
-    "RecipeInstructions",         # steps
-    "CookTime",
-    "PrepTime",
-    "RecipeCategory",
-    "Calories",
-    "RecipeServings",
-    "AggregatedRating",
-    "Description"
-]]
+# FORCE CAPITALIZED "Data" FOLDER
+DATA_DIR = os.path.join(BASE_DIR, "Data")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-# Remove rows with missing values in essential columns
-df = df.dropna(subset=["Name", "RecipeIngredientParts", "RecipeInstructions"])
+CSV_PATH = os.path.join(DATA_DIR, "recipes.csv")
+OUTPUT_PATH = os.path.join(DATA_DIR, "recipes_clean.json")
 
-# Add cuisine column
-df["cuisine"] = "international"
+print(f"Reading Kaggle data from: {CSV_PATH}")
+if not os.path.exists(CSV_PATH):
+    print(f"❌ Error: Could not find 'recipes.csv' inside {DATA_DIR}!")
+else:
+    df = pd.read_csv(CSV_PATH)
 
-# Rename columns to cleaner names
-df = df.rename(columns={
-    "Name": "name",
-    "RecipeIngredientParts": "ingredients",
-    "RecipeIngredientQuantities": "quantities",
-    "RecipeInstructions": "steps",
-    "CookTime": "cook_time",
-    "PrepTime": "prep_time",
-    "RecipeCategory": "category",
-    "Calories": "calories",
-    "RecipeServings": "servings",
-    "AggregatedRating": "rating",
-    "Description": "description"
-})
+    # Select target columns
+    df = df[[
+        "Name",
+        "RecipeIngredientParts",      
+        "RecipeIngredientQuantities", 
+        "RecipeInstructions",          
+        "CookTime",
+        "PrepTime",
+        "RecipeCategory",
+        "Calories",
+        "RecipeServings",
+        "AggregatedRating",
+        "Description"
+    ]]
 
-# Print info
-print(f" Total recipes after cleaning: {len(df)}")
-print(df.head(2))
+    # Remove missing entries
+    df = df.dropna(subset=["Name", "RecipeIngredientParts", "RecipeInstructions"])
 
-# Save to JSON orient="records" means each recipe becomes one object
-df.to_json("data/recipes_clean.json", orient="records", indent=2)
-print("Saved to data/recipes_clean.json")
+    # Mark dataset source tags
+    df["cuisine"] = "international"
+
+    # Map to standard JSON nomenclature
+    df = df.rename(columns={
+        "Name": "name",
+        "RecipeIngredientParts": "ingredients",
+        "RecipeIngredientQuantities": "quantities",
+        "RecipeInstructions": "steps",
+        "CookTime": "cook_time",
+        "PrepTime": "prep_time",
+        "RecipeCategory": "category",
+        "Calories": "calories",
+        "RecipeServings": "servings",
+        "AggregatedRating": "rating",
+        "Description": "description"
+    })
+
+    print(f"Total processed Kaggle recipes: {len(df)}")
+
+    # Export clean intermediate block
+    df.to_json(OUTPUT_PATH, orient="records", indent=2)
+    print(f"✅ Saved clean intermediate file to: {OUTPUT_PATH}")
