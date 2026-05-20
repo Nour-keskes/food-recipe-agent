@@ -3,47 +3,117 @@ import json
 import base64
 from dotenv import load_dotenv
 from groq import Groq
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
-# LOAD API KEY
-load_dotenv(r"F:\ProjetAgentAI\.env")
+# ─────────────────────────────────────────
+# ENVIRONMENT & CLIENT INITIALIZATION
+# ─────────────────────────────────────────
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    raise ValueError("GROQ_API_KEY is not set. Please add it to your .env file.")
 print(f"✅ API Key loaded: {api_key[:10]}...")
 
-# LOAD DATASET
-with open(r"F:\ProjetAgentAI\data\recipes_final.json", encoding="utf-8") as f:
-    recipes = json.load(f)
-print(f"✅ Loaded {len(recipes)} recipes")
-
-# ─────────────────────────────────────────
-# GROQ CLIENT
-# ─────────────────────────────────────────
 client = Groq(api_key=api_key)
-
-# llama-3.3-70b-versatile has much better tool-calling support than 8b-instant
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # ─────────────────────────────────────────
-# TOOL FUNCTIONS
+# CHUNKING HELPERS
 # ─────────────────────────────────────────
-def RecipeSearch(query: str) -> str:
-    query = query.lower()
-    results = [
-        r for r in recipes
-        if query in str(r.get("name", "")).lower()
-        or query in str(r.get("ingredients", "")).lower()
-    ]
-    if results:
-        top3 = results[:3]
-        output = f"Found {len(results)} recipes. Top 3:\n"
-        for r in top3:
-            output += f"\n🍽️ {r.get('name')}\n"
-            output += f"   Ingredients: {r.get('ingredients')}\n"
-            output += f"   Steps: {r.get('steps')}\n"
-            output += f"   Cook time: {r.get('cook_time')}\n---"
-        return output
-    return f"No recipe found for: {query}"
+CHUNK_SIZE = 200        # max characters per chunk
+CHUNK_OVERLAP = 100      # characters overlapping between consecutive chunks
 
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split a long string into overlapping character-level chunks."""
+    if not text or len(text) <= size:
+        return [text] if text else []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        chunks.append(text[start:end])
+        start += size - overlap
+    return chunks
+
+# ─────────────────────────────────────────
+# FAISS VECTOR INDEX (RAG SETUP WITH CHUNKING)
+# ─────────────────────────────────────────
+print("🧠 Loading Sentence Transformer embedding model...")
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+
+RECIPE_PATH = os.path.join(os.path.dirname(__file__), '..', 'Data', 'tunisian_recipes.json')
+with open(RECIPE_PATH, encoding="utf-8") as f:
+    recipes = json.load(f)
+print(f"✅ Loaded {len(recipes)} recipes — chunking for FAISS indexing...")
+
+# Each entry in chunk_store: {"text": str, "recipe_idx": int}
+chunk_store: list[dict] = []
+
+for recipe_idx, r in enumerate(recipes):
+    # Build a full context string per recipe then chunk it
+    full_text = (
+        f"Recipe: {r.get('name', '')}. "
+        f"Category: {r.get('category', '')}. "
+        f"Cuisine: {r.get('cuisine', '')}. "
+        f"Ingredients: {r.get('ingredients', '')}. "
+        f"Steps: {r.get('steps', '')}. "
+        f"Cook time: {r.get('cook_time', '')}."
+    )
+    for chunk in chunk_text(full_text):
+        chunk_store.append({"text": chunk, "recipe_idx": recipe_idx})
+
+print(f"⚡ {len(chunk_store)} chunks created — generating embeddings and building FAISS index...")
+chunk_texts = [c["text"] for c in chunk_store]
+embeddings = encoder.encode(chunk_texts, show_progress_bar=False)
+dimension = embeddings.shape[1]
+
+faiss_index = faiss.IndexFlatL2(dimension)
+faiss_index.add(np.array(embeddings).astype("float32"))
+print(f"✅ FAISS index ready ({faiss_index.ntotal} vectors).")
+
+# ─────────────────────────────────────────
+# SEMANTIC RAG TOOL FUNCTION
+# ─────────────────────────────────────────
+def RecipeSearch(query: str, top_k: int = 5) -> str:
+    """
+    Semantic FAISS search over chunked recipe text.
+    Retrieves top_k chunks, deduplicates by parent recipe,
+    and returns up to 3 unique full recipes.
+    """
+    query_vector = encoder.encode([query]).astype("float32")
+    k = min(top_k, faiss_index.ntotal)
+    distances, indices = faiss_index.search(query_vector, k)
+
+    seen_recipes: set[int] = set()
+    output = "Semantic Search Results (FAISS Chunk Match):\n"
+    found = 0
+
+    for idx in indices[0]:
+        if idx < 0 or idx >= len(chunk_store):
+            continue
+        recipe_idx = chunk_store[idx]["recipe_idx"]
+        if recipe_idx in seen_recipes:
+            continue  # deduplicate — only show each recipe once
+        seen_recipes.add(recipe_idx)
+        found += 1
+
+        r = recipes[recipe_idx]
+        output += f"\n🍽️ {r.get('name', 'Unknown')}\n"
+        output += f"   Ingredients: {r.get('ingredients', 'N/A')}\n"
+        output += f"   Steps: {r.get('steps', 'N/A')}\n"
+        output += f"   Cook time: {r.get('cook_time', 'N/A')}\n---"
+
+        if found >= 3:
+            break
+
+    return output if found > 0 else f"No matching recipe found for: '{query}'"
+
+# ─────────────────────────────────────────
+# ADDITIONAL TOOLS
+# ─────────────────────────────────────────
 def WebSearch(query: str) -> str:
     try:
         from duckduckgo_search import DDGS
@@ -77,20 +147,20 @@ def IngredientSubstitute(ingredient: str) -> str:
     return f"No substitute found for '{ingredient}'. Try WebSearch!"
 
 # ─────────────────────────────────────────
-# TOOLS DEFINITION
+# TOOL DECLARATIONS FOR THE AGENT
 # ─────────────────────────────────────────
 tools = [
     {
         "type": "function",
         "function": {
             "name": "RecipeSearch",
-            "description": "Search for food recipes in the local database. Use this first for any recipe request.",
+            "description": "Search semantically for food recipes using chunked FAISS vector retrieval. Use this first for any recipe requests.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search term, e.g. 'Brik', 'chicken', 'tuna'"
+                        "description": "The concept or dish query, e.g. 'spicy tuna starter', 'Brik', 'chicken'"
                     }
                 },
                 "required": ["query"]
@@ -101,15 +171,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "WebSearch",
-            "description": "Search the web for recipes or cooking tips not found in the local database.",
+            "description": "Search the web for recipes not found in the local vector database.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query"
-                    }
-                },
+                "properties": {"query": {"type": "string", "description": "The search query"}},
                 "required": ["query"]
             }
         }
@@ -118,24 +183,16 @@ tools = [
         "type": "function",
         "function": {
             "name": "IngredientSubstitute",
-            "description": "Get a substitute for a missing or unavailable ingredient.",
+            "description": "Get an ingredient alternative if the target item is missing.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "ingredient": {
-                        "type": "string",
-                        "description": "The ingredient name to find a substitute for"
-                    }
-                },
+                "properties": {"ingredient": {"type": "string", "description": "Ingredient name"}},
                 "required": ["ingredient"]
             }
         }
     }
 ]
 
-# ─────────────────────────────────────────
-# TOOL DISPATCHER
-# ─────────────────────────────────────────
 def run_tool(name, args):
     if name == "RecipeSearch":
         return RecipeSearch(args.get("query", ""))
@@ -146,57 +203,51 @@ def run_tool(name, args):
     return f"Unknown tool: {name}"
 
 # ─────────────────────────────────────────
-# MEMORY
+# CONVERSATIONAL STATE
 # ─────────────────────────────────────────
-chat_history = [
-    {
-        "role": "system",
-        "content": (
-            "You are a helpful food recipe assistant specializing in Tunisian and international cuisine.\n"
-            "- Always call RecipeSearch first when the user asks about a recipe.\n"
-            "- Call IngredientSubstitute when the user asks for a substitute.\n"
-            "- Call WebSearch only if RecipeSearch returns no results.\n"
-            "- Never answer recipe questions from memory alone; always use your tools first.\n"
-            "- Be friendly, detailed, and format recipes clearly with ingredients and steps."
-        )
-    }
-]
+SYSTEM_PROMPT = (
+    "You are a helpful food recipe assistant specializing in Tunisian and international cuisine.\n"
+    "- Always call RecipeSearch first when the user asks about recipes to query the FAISS vector space.\n"
+    "- Call IngredientSubstitute when looking for cooking alternatives.\n"
+    "- Call WebSearch only if the local vector lookup yields irrelevant contexts.\n"
+    "- Be friendly, detailed, and format your markdown lists clearly."
+)
+
+chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 # ─────────────────────────────────────────
-# CHAT FUNCTION
+# CHAT LOOP  (temperature-aware)
 # ─────────────────────────────────────────
-def chat(user_input):
+def chat(user_input: str, temperature: float = 0.7) -> str:
+    """
+    Run the agentic chat loop.
+    temperature: 0.0 = deterministic/precise, 1.5 = very creative.
+    """
     chat_history.append({"role": "user", "content": user_input})
+    max_iterations = 5
 
-    max_iterations = 5  # prevent infinite loops
-    iteration = 0
-
-    while iteration < max_iterations:
-        iteration += 1
-
+    for _ in range(max_iterations):
         try:
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=chat_history,
                 tools=tools,
                 tool_choice="auto",
-                max_tokens=1024
+                max_tokens=1024,
+                temperature=temperature,
             )
         except Exception as e:
-            # If the API call itself fails, return a graceful error
-            error_msg = f"Sorry, I encountered an error: {str(e)}"
+            error_msg = f"Error processing agent loop: {str(e)}"
             chat_history.append({"role": "assistant", "content": error_msg})
             return error_msg
 
         message = response.choices[0].message
 
-        # No tool calls → final answer
         if not message.tool_calls:
-            reply = message.content or "Sorry, I couldn't generate a response."
+            reply = message.content or "I couldn't generate a response."
             chat_history.append({"role": "assistant", "content": reply})
             return reply
 
-        # Append assistant message with tool calls
         chat_history.append({
             "role": "assistant",
             "content": message.content or "",
@@ -204,56 +255,34 @@ def chat(user_input):
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                }
-                for tc in message.tool_calls
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                } for tc in message.tool_calls
             ]
         })
 
-        # Execute each tool call
         for tc in message.tool_calls:
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
-                # Malformed arguments — return a safe error result
                 args = {}
-
-            try:
-                tool_result = run_tool(tc.function.name, args)
-            except Exception as e:
-                tool_result = f"Tool '{tc.function.name}' failed: {str(e)}"
-
+            tool_result = run_tool(tc.function.name, args)
             chat_history.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": str(tool_result)
             })
 
-    # Fallback if max iterations reached
-    fallback = "I'm sorry, I couldn't complete the request. Please try again."
-    chat_history.append({"role": "assistant", "content": fallback})
-    return fallback
+    return "Processing timeout reached."
 
 # ─────────────────────────────────────────
-# IMAGE IDENTIFICATION FUNCTION
+# VISION PROCESSING  (temperature-aware)
 # ─────────────────────────────────────────
-def identify_dish_from_image(image_path: str) -> str:
-    """Send image to Groq vision model to identify the dish"""
+def identify_dish_from_image(image_path: str, temperature: float = 0.3) -> str:
     with open(image_path, "rb") as f:
         image_data = base64.b64encode(f.read()).decode("utf-8")
 
     ext = image_path.split(".")[-1].lower()
-    if ext in ["jpg", "jpeg"]:
-        mime = "image/jpeg"
-    elif ext == "png":
-        mime = "image/png"
-    elif ext == "webp":
-        mime = "image/webp"
-    else:
-        mime = "image/jpeg"
+    mime = f"image/{'png' if ext == 'png' else 'jpeg'}"
 
     response = client.chat.completions.create(
         model=VISION_MODEL,
@@ -261,72 +290,31 @@ def identify_dish_from_image(image_path: str) -> str:
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{image_data}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Look at this food image carefully.\n"
-                            "1. Identify the dish name\n"
-                            "2. List the main ingredients you can see\n"
-                            "3. Guess the cuisine (Tunisian, Italian, French, etc.)\n\n"
-                            "Respond in this exact format:\n"
-                            "Dish: [name]\n"
-                            "Ingredients: [list]\n"
-                            "Cuisine: [type]"
-                        )
-                    }
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_data}"}},
+                    {"type": "text", "text": "Identify this dish, its visible components, and its national cuisine origins. Respond strictly using lines stating 'Dish: [name]', 'Ingredients: [list]', and 'Cuisine: [type]'."}
                 ]
             }
         ],
-        max_tokens=300
+        max_tokens=300,
+        temperature=temperature,
     )
     return response.choices[0].message.content.strip()
 
-
-def chat_with_image(image_path: str) -> str:
-    """Identify dish from image then search its recipe"""
-    print(f"🔍 Analyzing image: {image_path}")
-
-    # Step 1 — Identify the dish
+def chat_with_image(image_path: str, temperature: float = 0.7) -> str:
     try:
-        identification = identify_dish_from_image(image_path)
+        # Use lower temp for identification (factual), user temp for recipe generation
+        identification = identify_dish_from_image(image_path, temperature=max(0.1, temperature - 0.3))
     except Exception as e:
-        return f"❌ Could not analyze the image: {str(e)}"
+        return f"❌ Analysis fault: {str(e)}"
 
-    print(f"✅ Vision result:\n{identification}")
-
-    # Step 2 — Extract dish name
     dish_name = "this dish"
     for line in identification.split("\n"):
         if line.startswith("Dish:"):
             dish_name = line.replace("Dish:", "").strip()
             break
 
-    # Step 3 — Search recipe
-    recipe_result = chat(f"Give me the full detailed recipe for {dish_name} with ingredients and steps")
-
-    # Step 4 — Format final response
-    return f"""## 🔍 Image Analysis
-{identification}
-
----
-
-## 📖 Recipe for {dish_name}
-{recipe_result}"""
-
-
-# ─────────────────────────────────────────
-# TEST
-# ─────────────────────────────────────────
-if __name__ == "__main__":
-    print("\n--- Test 1 ---")
-    print(chat("How do I make Brik?"))
-    print("\n--- Test 2 ---")
-    print(chat("I don't have harissa, what can I use?"))
-    print("\n--- Test 3 (memory) ---")
-    print(chat("What was my first question?"))
+    recipe_result = chat(
+        f"Give me the full detailed recipe for {dish_name} with ingredients and steps",
+        temperature=temperature
+    )
+    return f"## 🔍 Image Analysis\n{identification}\n\n---\n\n## 📖 Recipe for {dish_name}\n{recipe_result}"
